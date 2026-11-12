@@ -27,7 +27,7 @@ git clone https://github.com/lcq666666/codex-context-provider.git ~/.agents/skil
 重新打开 Codex 后调用。
 
 ```text
-$codex-context-provider 检查我切换供应商后打不开的历史对话，并准备迁移。
+$codex-context-provider 检查并完成我切换供应商后打不开的历史对话迁移。
 ```
 
 ## 独立运行
