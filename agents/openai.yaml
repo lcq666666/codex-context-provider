@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Context Provider"
+  short_description: "Preserve local chat continuity across provider changes"
+  default_prompt: "Use $codex-context-provider to inspect provider mismatches and preserve my existing local Codex chats when switching providers."
