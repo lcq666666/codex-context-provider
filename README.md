@@ -57,7 +57,7 @@ python scripts/provider_history.py --home /path/to/codex-home --all --target sha
 
 ### 2. 关闭写入进程后应用
 
-先完全关闭使用该 Codex home 的桌面客户端、CLI 和 app-server，再在独立终端执行。`--offline` 表示执行者已确认写入进程停止。脚本的互斥锁只能协调本脚本的多个实例。
+先完全关闭使用该 Codex home 的桌面客户端、CLI 和 app-server，再在独立终端执行。`--offline` 表示执行者已确认写入进程停止。脚本的互斥锁只能协调本脚本的多个实例。应用前脚本还会检查是否仍有 Codex 写进程在跑，检测到就直接停下并列出进程，请关闭后再试；这项检查没有绕过选项。检测不到写进程时（例如系统没有 `ps` 或 `tasklist`），仍以 `--offline` 的确认为准。
 
 ```sh
 python scripts/provider_history.py --all --target shared --apply --offline
@@ -77,7 +77,7 @@ python scripts/provider_history.py --all --target shared --apply --offline
 python scripts/provider_history.py --restore /path/to/backup/manifest.json --apply --offline
 ```
 
-恢复只还原清单中记录的历史文件和 provider 字段。数据库中的其他会话按当前状态保留。中断后的恢复可重复执行。若迁移后历史文件已经产生新内容，恢复会停止并提示需要逐条检查，避免覆盖新对话。
+恢复会还原清单中记录的历史文件、provider 字段，以及迁移时修正过的索引路径（改回原值）。数据库中的其他会话按当前状态保留。中断后的恢复可重复执行。若迁移后历史文件已经产生新内容，恢复会停止并提示需要逐条检查，避免覆盖新对话。
 
 进程被强制终止可能留下 `.provider-history.lock`。确认相应迁移进程已结束后，移除该锁文件，再使用清单恢复。`preparing` 状态表示备份尚未完成，尚未开始修改原文件。
 
@@ -105,7 +105,7 @@ wire_api = "responses"
 - 同步 `threads.model_provider` 和第一条 `session_meta.payload.model_provider`。保持会话 ID、正文原始字节、未压缩历史文件总长度和正文起始偏移。
 - 适用于含 `id`、`model_provider`、`rollout_path` 字段的本地 `threads` 表，以及 `.jsonl` 和 `.jsonl.zst` 历史文件。数据库结构会在运行时检查。
 - 新 provider ID 超出原始元数据行的可用空间时，迁移会停止。使用较短的兼容 provider ID，可以保持既有历史偏移有效。
-- 历史文件缺失、路径已失效、首行结构变化或会话 ID 不匹配时，需要先处理对应问题。
+- 历史文件缺失、首行结构变化或会话 ID 不匹配时，需要先处理对应问题。索引仍指向 `.jsonl`、但只有同名 `.jsonl.zst` 存在时，预览和迁移会自动使用 `.zst` 文件，应用时把索引路径修正为 `.zst`，恢复时改回原值；两个文件都不存在时仍需先修路径。
 - SQLite 事务与文件替换之间存在跨资源中断窗口。预写清单、备份和可重复恢复用于处理这个窗口。正常运行异常会尝试还原已替换的文件。
 - 本地备份包含完整私密会话，请按本地隐私数据保存。脚本执行过程中只操作本地文件，无网络请求。
 - 本工具针对本地会话元数据。云端会话、跨设备同步，以及不同供应商对上下文和工具调用格式的处理，需要各自系统支持。

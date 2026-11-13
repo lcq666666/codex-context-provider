@@ -20,11 +20,11 @@ python scripts/provider_history.py --all
 python scripts/provider_history.py --thread THREAD_ID --target PROVIDER_ID
 ```
 
-Both commands preview changes. `--all` includes archived indexed threads. `--home PATH` selects another Codex home. Multiple discovered state databases require an explicit `--db PATH`. A missing rollout path needs separate path repair before this migration can proceed.
+Both commands preview changes. `--all` includes archived indexed threads. `--home PATH` selects another Codex home. Multiple discovered state databases require an explicit `--db PATH`. A stale `.jsonl` index path falls back to the matching `.jsonl.zst` file when it exists; applying the migration corrects the index path to the `.zst` file, and recovery restores the original path. A rollout missing in both forms still needs separate path repair before this migration can proceed.
 
 ## Apply an authorized migration offline
 
-Apply after all Codex desktop, CLI, and app-server processes writing to this home have stopped. The lock excludes other copies of this script. Codex itself does not honor that lock. When operating from the affected Codex session, prepare the preview and terminal command, then hand execution to the user after they close Codex. Use an independent runtime only when the affected writers are stopped.
+Apply after all Codex desktop, CLI, and app-server processes writing to this home have stopped. The lock excludes other copies of this script. Codex itself does not honor that lock. The script also refuses to apply while it detects a running Codex writer process, and there is no flag to bypass that check; close the listed writers and retry. When writer detection is unavailable on the system, `--offline` remains the confirmation that writers have stopped. When operating from the affected Codex session, prepare the preview and terminal command, then hand execution to the user after they close Codex. Use an independent runtime only when the affected writers are stopped.
 
 For an authorized repair, use the chosen scope and target with the write flags.
 
@@ -40,7 +40,7 @@ Follow the output's backup path for rollback or crash recovery.
 python scripts/provider_history.py --restore /path/to/manifest.json --apply --offline
 ```
 
-Recovery preflights recorded file hashes and database providers. A crash during restoration can be recovered by rerunning the same command. A rollout with newer edits requires individual inspection before recovery to preserve those edits. Backups contain private conversations and stay local.
+Recovery preflights recorded file hashes and database providers. A crash during restoration can be recovered by rerunning the same command. A rollout with newer edits requires individual inspection before recovery to preserve those edits. Recovery also restores any index path the migration corrected. Backups contain private conversations and stay local.
 
 ## Verify and report
 

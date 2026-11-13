@@ -26,7 +26,8 @@ class ProviderHistoryTests(unittest.TestCase):
                                'rollout_path TEXT, archived INTEGER, title TEXT)')
         self.originals = {}
 
-    def add_thread(self, name, provider='legacy-provider', compressed=False, metadata_provider=None):
+    def add_thread(self, name, provider='legacy-provider', compressed=False, metadata_provider=None,
+                   rollout_path=None):
         suffix = '.jsonl.zst' if compressed else '.jsonl'
         path = self.home / (name + suffix)
         meta = {'type': 'session_meta', 'payload': {'id': name, 'model_provider': provider}}
@@ -40,8 +41,13 @@ class ProviderHistoryTests(unittest.TestCase):
         self.originals[name] = data
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute('INSERT INTO threads VALUES (?, ?, ?, ?, ?)',
-                               (name, provider, str(path), int(name.endswith('2')), 'Sample title'))
+                               (name, provider, rollout_path if rollout_path is not None else str(path),
+                                int(name.endswith('2')), 'Sample title'))
         return path
+
+    def rollout_path(self, name):
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            return connection.execute('SELECT rollout_path FROM threads WHERE id=?', (name,)).fetchone()[0]
 
     def run_tool(self, *args):
         return tool.main(['--home', str(self.home), *args])
@@ -105,6 +111,51 @@ class ProviderHistoryTests(unittest.TestCase):
         self.assertEqual(before.partition(b'\n')[2], after.partition(b'\n')[2])
         self.run_tool('--restore', str(self.backup()), '--apply', '--offline')
         self.assertEqual(path.read_bytes(), self.originals['thread1'])
+
+    def test_stale_jsonl_falls_back_to_zst_and_repairs_index_path(self):
+        try:
+            tool.codec()
+        except tool.MigrationError:
+            self.skipTest('Zstandard implementation unavailable')
+        stale = str(self.home / 'thread1.jsonl')
+        path = self.add_thread('thread1', compressed=True, rollout_path=stale)
+        self.assertEqual(self.run_tool('--all')['changes'], 1)
+        self.assertEqual(self.run_tool('--all', '--apply', '--offline')['migrated'], 1)
+        self.assertEqual(self.provider('thread1'), 'shared')
+        self.assertEqual(self.rollout_path('thread1'), str(path))
+        self.assertEqual(self.run_tool('--all')['changes'], 0)
+        self.run_tool('--restore', str(self.backup()), '--apply', '--offline')
+        self.assertEqual(path.read_bytes(), self.originals['thread1'])
+        self.assertEqual(self.provider('thread1'), 'legacy-provider')
+        self.assertEqual(self.rollout_path('thread1'), stale)
+
+    def test_stale_path_is_repaired_even_when_provider_already_matches(self):
+        try:
+            tool.codec()
+        except tool.MigrationError:
+            self.skipTest('Zstandard implementation unavailable')
+        stale = str(self.home / 'thread1.jsonl')
+        path = self.add_thread('thread1', provider='shared', compressed=True, rollout_path=stale)
+        self.assertEqual(self.run_tool('--all')['changes'], 1)
+        self.run_tool('--all', '--apply', '--offline')
+        self.assertEqual(self.rollout_path('thread1'), str(path))
+        self.assertEqual(self.run_tool('--all')['changes'], 0)
+
+    def test_missing_rollout_and_zst_still_refused_without_backup(self):
+        path = self.add_thread('thread1')
+        path.unlink()
+        with self.assertRaises(SystemExit):
+            self.run_tool('--all')
+        self.assertFalse((self.home / 'backups').exists())
+
+    def test_both_jsonl_and_zst_present_prefers_jsonl(self):
+        path = self.add_thread('thread1')
+        zst = self.home / 'thread1.jsonl.zst'
+        zst.write_bytes(b'not a real compressed frame')
+        self.run_tool('--all', '--apply', '--offline')
+        self.assertEqual(self.rollout_path('thread1'), str(path))
+        self.assertEqual(zst.read_bytes(), b'not a real compressed frame')
+        self.assertEqual(json.loads(path.read_bytes().splitlines()[0])['payload']['model_provider'], 'shared')
 
     def test_restore_exact_bytes_is_repeatable_and_keeps_new_threads(self):
         path = self.add_thread('thread1')
@@ -183,6 +234,33 @@ class ProviderHistoryTests(unittest.TestCase):
         (self.home / '.provider-history.lock').write_text('123')
         with self.assertRaises(SystemExit):
             self.run_tool('--all', '--apply', '--offline')
+
+    def test_live_writer_blocks_apply(self):
+        path = self.add_thread('thread1')
+        with patch.object(tool, 'codex_writer_processes', return_value=[(123, 'codex')]):
+            with self.assertRaises(SystemExit):
+                self.run_tool('--all', '--apply', '--offline')
+        self.assertEqual(path.read_bytes(), self.originals['thread1'])
+        self.assertEqual(self.provider('thread1'), 'legacy-provider')
+        self.assertFalse((self.home / 'backups').exists())
+
+    def test_live_writer_blocks_restore(self):
+        self.add_thread('thread1')
+        self.run_tool('--all', '--apply', '--offline')
+        with patch.object(tool, 'codex_writer_processes', return_value=[(123, 'codex')]):
+            with self.assertRaises(SystemExit):
+                self.run_tool('--restore', str(self.backup()), '--apply', '--offline')
+        self.assertEqual(self.provider('thread1'), 'shared')
+
+    def test_live_writer_does_not_block_preview(self):
+        self.add_thread('thread1')
+        with patch.object(tool, 'codex_writer_processes', return_value=[(123, 'codex')]):
+            self.assertEqual(self.run_tool('--all')['changes'], 1)
+
+    def test_unavailable_writer_detection_warns_and_proceeds(self):
+        self.add_thread('thread1')
+        with patch.object(tool, 'codex_writer_processes', return_value=None):
+            self.assertEqual(self.run_tool('--all', '--apply', '--offline')['migrated'], 1)
 
     def test_profile_requires_explicit_target(self):
         self.add_thread('thread1')

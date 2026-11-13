@@ -3,13 +3,17 @@
 
 import argparse
 from contextlib import contextmanager
+import csv
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -43,7 +47,6 @@ def unpack(path, data):
         return data
     module = codec()
     # Stream readers also support frames without a declared decompressed size.
-    import io
     if hasattr(module, 'ZstdFile'):
         with module.ZstdFile(io.BytesIO(data), 'rb') as stream:
             return stream.read()
@@ -134,18 +137,106 @@ def connect(path, write=False):
         connection.close()
 
 
+def codex_writer_processes():
+    """Best-effort list of running Codex writer processes as (pid, name).
+
+    Returns [] when the process list was checked and no writer was found,
+    and None when detection is unavailable on this platform (no `ps` or
+    `tasklist`, or the listing itself failed). Callers must not treat an
+    empty list as proof that every writer has stopped; --offline remains
+    the caller's confirmation.
+    """
+    try:
+        if os.name == 'nt':
+            if shutil.which('tasklist') is None:
+                return None
+            result = subprocess.run(['tasklist', '/FO', 'CSV', '/NH'],
+                                    capture_output=True, text=True, timeout=10)
+            writers = []
+            for row in csv.reader(io.StringIO(result.stdout)):
+                if len(row) >= 2 and row[0].strip().lower() in {'codex.exe', 'codex-app-server.exe'}:
+                    try:
+                        writers.append((int(row[1]), row[0].strip()))
+                    except ValueError:
+                        continue
+            return writers
+        if shutil.which('ps') is None:
+            return None
+        result = subprocess.run(['ps', '-eo', 'pid=,comm=,args='],
+                                capture_output=True, text=True, timeout=10)
+        writers = []
+        for line in result.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            if pid == os.getpid():
+                continue
+            comm = parts[1].lower()
+            tokens = parts[2].split() if len(parts) > 2 else []
+            first = os.path.basename(tokens[0]).lower() if tokens else ''
+            if comm in {'codex', 'codex.exe'} or first in {'codex', 'codex.exe'}:
+                writers.append((pid, parts[1]))
+        return writers
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def require_no_live_writers():
+    """Refuse to write while a Codex writer process is detected.
+
+    This is a best-effort safety net for the offline-only workflow: the
+    script lock coordinates script instances only, Codex does not honor
+    it. There is intentionally no flag to bypass this check; close the
+    listed writers and retry. When detection is unavailable, warn on
+    stderr and proceed on the --offline confirmation.
+    """
+    writers = codex_writer_processes()
+    if writers is None:
+        print('Warning: could not check for running Codex writers; '
+              'relying on the --offline confirmation.', file=sys.stderr)
+        return
+    if not writers:
+        return
+    description = ', '.join(f'{name} (pid {pid})' for pid, name in writers)
+    raise MigrationError(
+        f'Codex writers still running: {description}. Close Codex desktop, '
+        'CLI and app-server, then retry.'
+    )
+
+
 def resolve_rollout(home, raw):
+    """Resolve a rollout path, falling back from a stale .jsonl index to .jsonl.zst.
+
+    Returns (path, corrected_raw): path is the file to read and write, and
+    corrected_raw is the database value to store on apply, or None when the
+    indexed path was already correct. When both files exist, the .jsonl
+    file named by the index wins.
+    """
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = home / path
     if path.is_symlink():
         raise MigrationError(f'Symlink rollout is unsupported: {path}')
-    path = path.resolve()
-    if not path.is_file():
-        raise MigrationError(f'Rollout missing: {path}. Repair its database path first.')
-    if path.is_symlink() or not (path.name.endswith('.jsonl') or path.name.endswith('.jsonl.zst')):
-        raise MigrationError(f'Unsupported rollout file: {path}')
-    return path
+    resolved = path.resolve()
+    if resolved.is_file():
+        if resolved.is_symlink() or not (resolved.name.endswith('.jsonl') or resolved.name.endswith('.jsonl.zst')):
+            raise MigrationError(f'Unsupported rollout file: {resolved}')
+        return resolved, None
+    if path.name.endswith('.jsonl'):
+        compressed = Path(str(path) + '.zst')
+        if compressed.is_symlink():
+            raise MigrationError(f'Symlink rollout is unsupported: {compressed}')
+        compressed_resolved = compressed.resolve()
+        if compressed_resolved.is_file() and compressed_resolved.name.endswith('.jsonl.zst'):
+            return compressed_resolved, raw + '.zst'
+    raise MigrationError(
+        f'Rollout missing: {resolved}. The matching .jsonl.zst file was also not found. '
+        'Repair its database path first.'
+    )
 
 
 def plan(connection, home, args):
@@ -157,17 +248,19 @@ def plan(connection, home, args):
     entries = []
     seen = set()
     for thread_id, provider, raw_path in rows:
-        path = resolve_rollout(home, raw_path)
+        path, corrected_raw = resolve_rollout(home, raw_path)
         if path in seen:
             raise MigrationError(f'Multiple selected threads share a rollout: {path}')
         seen.add(path)
         original = path.read_bytes()
         modified, metadata_provider = rewrite(path, original, thread_id, args.target)
-        if provider == args.target and original == modified:
+        if provider == args.target and original == modified and corrected_raw is None:
             continue
         entries.append({
             'id': thread_id, 'provider_before': provider, 'metadata_provider_before': metadata_provider,
-            'rollout_path_before': raw_path, 'path': str(path),
+            'rollout_path_before': raw_path,
+            'rollout_path_after': corrected_raw if corrected_raw is not None else raw_path,
+            'path': str(path),
             'before_sha256': digest(original), 'after_sha256': digest(modified),
         })
     return entries, len(rows)
@@ -191,10 +284,11 @@ def migration_lock(home):
         path.unlink(missing_ok=True)
 
 
-def row_state(connection, entry):
+def row_state(connection, entry, allowed_paths=None):
     row = connection.execute('SELECT model_provider, rollout_path FROM threads WHERE id=?',
                              (entry['id'],)).fetchone()
-    if row is None or row[1] != entry['rollout_path_before']:
+    expected = allowed_paths if allowed_paths is not None else {entry['rollout_path_before']}
+    if row is None or row[1] not in expected:
         raise MigrationError(f'Thread or rollout path changed: {entry["id"]}')
     return row[0]
 
@@ -241,8 +335,8 @@ def migrate(connection, home, db_path, args, entries, config_data):
                 raise MigrationError(f'Rollout changed before apply: {entry["id"]}')
             atomic_write(path, (folder / entry['staged_file']).read_bytes())
             replaced.append(entry)
-            connection.execute('UPDATE threads SET model_provider=? WHERE id=?',
-                               (args.target, entry['id']))
+            connection.execute('UPDATE threads SET model_provider=?, rollout_path=? WHERE id=?',
+                               (args.target, entry['rollout_path_after'], entry['id']))
         if connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
             raise MigrationError('SQLite integrity check failed.')
         connection.commit()
@@ -280,15 +374,17 @@ def restore(home, manifest_path):
             saved = (folder / entry['backup_file']).resolve()
             if saved.parent != folder.resolve() or digest(saved.read_bytes()) != entry['before_sha256']:
                 raise MigrationError('Backup file is missing, altered, or outside the backup folder.')
-            if row_state(connection, entry) not in {entry['provider_before'], manifest['target_provider']}:
+            allowed_paths = {entry['rollout_path_before'],
+                             entry.get('rollout_path_after', entry['rollout_path_before'])}
+            if row_state(connection, entry, allowed_paths) not in {entry['provider_before'], manifest['target_provider']}:
                 raise MigrationError(f'Provider changed since migration: {entry["id"]}')
         for entry in manifest['entries']:
             path = Path(entry['path'])
             if digest(path.read_bytes()) not in {entry['before_sha256'], entry['after_sha256']}:
                 raise MigrationError(f'Rollout changed during recovery: {entry["id"]}')
             atomic_write(path, (folder / entry['backup_file']).read_bytes())
-            connection.execute('UPDATE threads SET model_provider=? WHERE id=?',
-                               (entry['provider_before'], entry['id']))
+            connection.execute('UPDATE threads SET model_provider=?, rollout_path=? WHERE id=?',
+                               (entry['provider_before'], entry['rollout_path_before'], entry['id']))
         connection.commit()
     manifest['status'] = 'restored'
     save_manifest(folder, manifest)
@@ -311,6 +407,8 @@ def main(argv=None):
     try:
         if args.apply and not args.offline:
             raise MigrationError('Stop Codex desktop, CLI and app-server writers, then pass --offline.')
+        if args.apply:
+            require_no_live_writers()
         if args.restore:
             if args.target or args.db:
                 raise MigrationError('--restore uses the database and providers recorded in its manifest.')
